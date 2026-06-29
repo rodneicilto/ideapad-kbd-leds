@@ -1,0 +1,33 @@
+#!/bin/bash
+# IdeaPad CapsLock/NumLock LED sync
+# Workaround for Lenovo IdeaPad 83RR/83SR (Wildcat Lake)
+# Requires: atkbd softleds kernel patch + ideapad-laptop EC LED driver
+#
+# Polls virtual LED state (input3::capslock/numlock) from atkbd/softleds
+# and propagates to physical LED driver (input::capslock/numlock) from
+# ideapad-laptop via EC offset 0xA1 + ACPI _QDF.
+
+CAPS_VIRTUAL="/sys/class/leds/input3::capslock/brightness"
+NUM_VIRTUAL="/sys/class/leds/input3::numlock/brightness"
+CAPS_PHYSICAL="/sys/class/leds/input::capslock/brightness"
+NUM_PHYSICAL="/sys/class/leds/input::numlock/brightness"
+
+CAPS_PREV=-1
+NUM_PREV=-1
+
+while true; do
+    CAPS=$(cat "$CAPS_VIRTUAL" 2>/dev/null)
+    NUM=$(cat "$NUM_VIRTUAL" 2>/dev/null)
+
+    if [ "$CAPS" != "$CAPS_PREV" ] && [ -w "$CAPS_PHYSICAL" ]; then
+        echo "$CAPS" > "$CAPS_PHYSICAL"
+        CAPS_PREV=$CAPS
+    fi
+
+    if [ "$NUM" != "$NUM_PREV" ] && [ -w "$NUM_PHYSICAL" ]; then
+        echo "$NUM" > "$NUM_PHYSICAL"
+        NUM_PREV=$NUM
+    fi
+
+    sleep 0.05
+done

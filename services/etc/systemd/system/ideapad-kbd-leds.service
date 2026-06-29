@@ -1,0 +1,15 @@
+[Unit]
+Description=IdeaPad CapsLock/NumLock LED sync
+Documentation=https://github.com/rodnei-cilto/ideapad-83rr-linux-support
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ideapad-kbd-leds
+Restart=always
+RestartSec=1
+Nice=19
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target

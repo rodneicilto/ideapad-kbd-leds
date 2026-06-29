@@ -1,0 +1,143 @@
+From: Rodnei Cilto <rodnei.cilto@gmail.com>
+Date: Mon, 26 May 2026
+Subject: [PATCH 1/2] input: atkbd: add softleds quirk for broken EC PS/2 emulation
+
+Co-developed-by: Lucio Zanette <luciozanette@gmail.com>
+Signed-off-by: Lucio Zanette <luciozanette@gmail.com>
+Signed-off-by: Rodnei Cilto <rodnei.cilto@gmail.com>
+
+Some Lenovo IdeaPad laptops (e.g. 83RR/83SR, Wildcat Lake) implement
+PS/2 keyboard emulation via the Embedded Controller (EC) but do not
+fully support the AT protocol. Specifically, sending the SETLEDS
+command (0xED) after initialization causes the EC to return corrupted
+scancodes (reported as '**' in i8042.debug), rendering the keyboard
+non-functional.
+
+The existing SERIO_QUIRK_DUMBKBD resolves scancode corruption by
+zeroing serio->write, preventing AT commands. However, LED registration
+in atkbd_set_device_attrs() depends on atkbd->write being set, so
+dumbkbd mode loses EV_LED capabilities entirely.
+
+Note: serio->id.extra is __u8 (8 bits only) and cannot be used to
+pass new quirk flags from i8042 to atkbd. The quirk is detected
+directly in atkbd via its DMI quirk table.
+
+Introduce atkbd_softleds: a DMI-detected mode that combines dumbkbd
+behaviour (serio->write = NULL, no 0xED sent) with EV_LED registration
+so that CapsLock/NumLock/ScrollLock state remains visible to userspace
+via the input subsystem.
+
+Add DMI entries for Lenovo IdeaPad 83RR (Wildcat Lake) and its Brazil
+regional variant 83SR.
+
+Signed-off-by: Rodnei <developer@bellatrix>
+---
+--- a/drivers/input/keyboard/atkbd.c
++++ b/drivers/input/keyboard/atkbd.c
+@@ -212,6 +212,7 @@
+ 	bool softrepeat;
+ 	bool softraw;
+ 	bool scroll;
++	bool softleds;		/* suppress 0xED, register EV_LED in software */
+ 	bool enabled;
+ 
+ 	/* Accessed only from interrupt */
+@@ -245,6 +246,7 @@
+  * to many commands until full reset (ATKBD_CMD_RESET_BAT) is performed.
+  */
+ static bool atkbd_skip_deactivate;
++static bool atkbd_softleds;
+ 
+ static ssize_t atkbd_attr_show_helper(struct device *dev, char *buf,
+ 				      ssize_t (*handler)(struct atkbd *, char *));
+@@ -600,6 +602,14 @@
+ 	struct input_dev *dev = atkbd->dev;
+ 	u8 param[2];
+ 
++	/*
++	 * softleds: EC PS/2 emulation does not support AT commands
++	 * after initialization. Accept LED state from userspace but
++	 * never send SETLEDS (0xED) to avoid scancode corruption.
++	 */
++	if (atkbd->softleds)
++		return 0;
++
+ 	param[0] = (test_bit(LED_SCROLLL, dev->led) ? 1 : 0)
+ 		 | (test_bit(LED_NUML,    dev->led) ? 2 : 0)
+ 		 | (test_bit(LED_CAPSL,   dev->led) ? 4 : 0);
+@@ -1193,7 +1203,7 @@
+ 	input_dev->evbit[0] = BIT_MASK(EV_KEY) | BIT_MASK(EV_REP) |
+ 		BIT_MASK(EV_MSC);
+ 
+-	if (atkbd->write) {
++	if (atkbd->write || atkbd->softleds) {
+ 		input_dev->evbit[0] |= BIT_MASK(EV_LED);
+ 		input_dev->ledbit[0] = BIT_MASK(LED_NUML) |
+ 			BIT_MASK(LED_CAPSL) | BIT_MASK(LED_SCROLLL);
+@@ -1291,6 +1301,12 @@
+ 	if (atkbd->softrepeat)
+ 		atkbd->softraw = true;
+ 
++	if (atkbd_softleds) {
++		serio->write = NULL;
++		atkbd->write = false;
++		atkbd->softleds = true;
++	}
++
+ 	serio_set_drvdata(serio, atkbd);
+ 
+ 	err = serio_open(serio, drv);
+@@ -1767,6 +1783,12 @@
+ 	return 1;
+ }
+ 
++static int __init atkbd_setup_softleds(const struct dmi_system_id *id)
++{
++	atkbd_softleds = true;
++	return 1;
++}
++
+ /*
+  * NOTE: do not add any more "force release" quirks to this table.  The
+  * task of adjusting list of keys that should be "released" automatically
+@@ -1938,6 +1960,28 @@
+ 		},
+ 		.callback = atkbd_deactivate_fixup,
+ 	},
++	{
++		/*
++		 * Lenovo IdeaPad 83RR (Wildcat Lake) - EC PS/2 emulation
++		 * returns corrupted scancodes ('**' in i8042.debug) when
++		 * receiving AT SETLEDS (0xED) after keyboard initialization.
++		 * Enable softleds mode: suppress 0xED to hardware while
++		 * keeping CapsLock/NumLock/ScrollLock visible to userspace.
++		 */
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "83RR"),
++		},
++		.callback = atkbd_setup_softleds,
++	},
++	{
++		/* Lenovo IdeaPad 83SR (83RR Brazil regional variant) */
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "83SR"),
++		},
++		.callback = atkbd_setup_softleds,
++	},
+ 	{ }
+ };
+ 
+--- a/drivers/input/serio/i8042-acpipnpio.h
++++ b/drivers/input/serio/i8042-acpipnpio.h
+@@ -79,6 +79,9 @@
+ #define SERIO_QUIRK_DIRECT		BIT(8)
+ #define SERIO_QUIRK_DUMBKBD		BIT(9)
+ #define SERIO_QUIRK_NOLOOP		BIT(10)
++/* SERIO_QUIRK_DUMBKBD_LEDS handled via atkbd DMI quirk table.
++ * serio->id.extra is __u8 (8 bits only), cannot carry this flag.
++ */
+ #define SERIO_QUIRK_NOTIMEOUT		BIT(11)
+ #define SERIO_QUIRK_KBDRESET		BIT(12)
+ #define SERIO_QUIRK_DRITEK		BIT(13)
